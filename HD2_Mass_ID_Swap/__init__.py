@@ -232,9 +232,20 @@ def get_transient_archive(sdk, archive_id):
 
 
 def get_destination_unit_ids(sdk, archive_id):
-    """Return destination Unit IDs without adding an archive to HD2SDK's UI."""
+    """Return destination IDs from HD2SDK's lightweight search TOCs when possible."""
+    archive_id = str(archive_id).lower()
+    unit_id = int(sdk.UnitID)
+    for archive in sdk.Global_TocManager.SearchArchives:
+        if (
+            str(archive.Name).lower() == archive_id
+            or os.path.basename(str(archive.Path)).lower() == archive_id
+        ):
+            return list(dict.fromkeys(int(entry_id) for entry_id in archive.TocEntries.get(unit_id, [])))
+
+    # This fallback is needed only when HD2SDK has not built SearchArchives
+    # yet. It is deliberately private, so it does not add to Loaded Archives.
     archive = get_transient_archive(sdk, archive_id)
-    return list(archive.TocDict.get(int(sdk.UnitID), {}).keys())
+    return list(archive.TocDict.get(unit_id, {}).keys())
 
 
 def get_transient_unit_entry(target_id):
@@ -1396,20 +1407,6 @@ def analyze_mapping(sdk, scene):
             str(destination.archive_id).lower(): archive_slot_targets(details, destination.archive_id, target_ids)
             for destination, target_ids in archive_targets
         }
-        target_ids = set().union(*(target_ids for _, target_ids in archive_targets))
-        target_body_types = collect_target_body_types(sdk, target_ids)
-        for slot_targets in destination_slot_targets.values():
-            for target_id, slot_key in slot_targets.items():
-                actual_body_type = target_body_types[target_id]
-                if (
-                    actual_body_type is not None
-                    and slot_key[0] != "Any"
-                    and actual_body_type != slot_key[0]
-                ):
-                    raise MappingError(
-                        f"Unit {target_id} BodyType is {actual_body_type}, but JSON expects "
-                        f"{slot_key[0]}/{slot_key[1]}/{slot_key[2]}."
-                    )
         plan = solve_slot_assignment(
             archive_targets,
             source_keys,
