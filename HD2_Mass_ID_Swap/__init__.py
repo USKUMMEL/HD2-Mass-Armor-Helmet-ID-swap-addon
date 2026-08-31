@@ -1,7 +1,7 @@
 bl_info = {
     "name": "HD2_Mass_ID_Swap",
     "author": "HD2SDK Script Workspace",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > HD2",
     "description": "Collect source armor Units and destination archives for multi-ID swaps",
@@ -10,12 +10,14 @@ bl_info = {
 
 import copy
 import base64
+import gc
 import hashlib
 import importlib
 import json
 import os
 import struct
 import sys
+import time
 import zlib
 
 import bpy
@@ -256,16 +258,60 @@ def get_transient_unit_entry(target_id):
     return entry
 
 
-def payload_digest(entry):
-    """Content-address a complete resource, not merely its source ID."""
-    toc_data = bytes(entry.TocData)
-    gpu_data = bytes(entry.GpuData)
-    stream_data = bytes(entry.StreamData)
+def payload_digest(entry, digest_cache=None):
+    """Content-address a resource once, reusing shared buffer identity."""
+    payload = (
+        entry.TocData if entry.TocData is not None else b"",
+        entry.GpuData if entry.GpuData is not None else b"",
+        entry.StreamData if entry.StreamData is not None else b"",
+    )
+    identity_key = (
+        "buffers",
+        *((id(data), len(data)) for data in payload),
+    )
+    if digest_cache is not None:
+        cached = digest_cache.get(identity_key)
+        if cached is not None:
+            return cached
+
     digest = hashlib.sha256()
-    for data in (toc_data, gpu_data, stream_data):
+    for data in payload:
         digest.update(len(data).to_bytes(8, "little"))
-        digest.update(data)
-    return digest.digest(), (toc_data, gpu_data, stream_data)
+        # hashlib consumes bytes-like buffers directly.  Avoid bytes(data),
+        # which copied several megabytes for every destination alias.
+        try:
+            digest.update(data)
+        except TypeError:
+            digest.update(memoryview(data))
+    result = (digest.digest(), payload)
+    if digest_cache is not None:
+        digest_cache[identity_key] = result
+    return result
+
+
+def payloads_equal(left, right):
+    """Collision-safe equality with an O(1) path for shared alias buffers."""
+    return all(
+        left_data is right_data
+        or (len(left_data) == len(right_data) and left_data == right_data)
+        for left_data, right_data in zip(left, right)
+    )
+
+
+def make_payload_alias(entry, target_id, unit_id):
+    """Create a lightweight TocEntry alias without copying its parsed mesh graph."""
+    alias = copy.copy(entry)
+    alias.FileID = int(target_id)
+    alias.TypeID = int(unit_id)
+    # Serialization uses only the three payload buffers.  Keeping RawMeshes on
+    # every target was the source of the multi-gigabyte RAM growth.
+    alias.LoadedData = None
+    alias.IsLoaded = False
+    alias.IsSelected = False
+    alias.TocData_OLD = b""
+    alias.GpuData_OLD = b""
+    alias.StreamData_OLD = b""
+    return alias
 
 
 def normalize_body_type(value):
@@ -313,8 +359,60 @@ def optional_entry_body_type(entry):
         return None
 
 
-def is_hidden_dummy_unit(entry):
-    """Recognize the valid one-vertex/zero-index Units commonly used to hide geometry."""
+class _NoArchiveLookupManager:
+    """Minimal manager used by the SDK mesh parser during source inspection."""
+
+    @staticmethod
+    def GetEntry(*_args, **_kwargs):
+        return None
+
+    @staticmethod
+    def Load(*_args, **_kwargs):
+        return None
+
+
+def inspect_source_raw_meshes(entry, sdk):
+    """Parse one Unit locally without HD2SDK searching/loading dependencies."""
+    if getattr(entry, "IsLoaded", False) and getattr(entry, "LoadedData", None) is not None:
+        return entry.LoadedData.RawMeshes
+
+    mesh_class = getattr(sdk, "StingrayMeshFile", None)
+    stream_class = getattr(sdk, "MemoryStream", None)
+    if mesh_class is None or stream_class is None:
+        raise MappingError("HD2SDK does not expose its lightweight Unit parser.")
+
+    mesh = mesh_class()
+    mesh.NameHash = int(entry.FileID)
+    mesh.LoadMaterialSlotNames = False
+    settings = getattr(bpy.context.scene, "Hd2ToolPanelSettings", None)
+    previous_import_materials = (
+        getattr(settings, "ImportMaterials", None) if settings is not None else None
+    )
+    try:
+        # The SDK's index parser otherwise creates Blender materials.  With
+        # this flag and the no-op manager it performs neither material import
+        # nor any SearchAll archive scan.
+        if previous_import_materials is not None:
+            settings.ImportMaterials = True
+        mesh.Serialize(
+            stream_class(entry.TocData),
+            stream_class(entry.GpuData),
+            _NoArchiveLookupManager(),
+        )
+    finally:
+        if previous_import_materials is not None:
+            settings.ImportMaterials = previous_import_materials
+    return mesh.RawMeshes
+
+
+def is_hidden_dummy_unit(entry, sdk=None):
+    """Reject hidden and sparse non-render source Units without parsing normal meshes.
+
+    A game Unit can retain tiny sentinel triangles or a small proxy mesh beside
+    one-vertex LOD shells.  Those Units are useful to the game as placeholders,
+    but must not consume a source slot in an ID-swap.  Genuine armor Units have
+    several render meshes and substantially more geometry.
+    """
     cache_key = (
         int(getattr(entry, "TocDataOffset", 0)),
         int(getattr(entry, "GpuResourceOffset", 0)),
@@ -336,9 +434,10 @@ def is_hidden_dummy_unit(entry):
             HIDDEN_SOURCE_CACHE[cache_key] = False
         return False
     try:
-        if not entry.IsLoaded:
-            entry.Load(True, False)
-        meshes = entry.LoadedData.RawMeshes
+        sdk = sdk or get_sdk()
+        if sdk is None:
+            return False
+        meshes = inspect_source_raw_meshes(entry, sdk)
         fully_hidden = bool(meshes) and all(
             len(mesh.VertexPositions) == 1
             and not mesh.Indices
@@ -362,7 +461,21 @@ def is_hidden_dummy_unit(entry):
             and visible_vertices <= 64
             and visible_indices <= 96
         )
-        result = fully_hidden or mostly_hidden
+        # The source-test patch exposed a second, distinct non-render pattern:
+        # 5–6 stored meshes, but only 1–2 tiny render meshes (28–882 vertices)
+        # and the rest one-vertex shells.  A usable armor/helmet source has at
+        # least three render meshes and thousands of indices.  This inspection
+        # only runs for <=64 KB entries, so it does not deserialize real armor
+        # payloads and remains constant-time for normal Generate/Write runs.
+        sparse_non_render = (
+            len(meshes) >= 3
+            and (
+                len(visible_meshes) <= 2
+                or visible_vertices < 2000
+                or visible_indices < 3000
+            )
+        )
+        result = fully_hidden or mostly_hidden or sparse_non_render
         if can_cache:
             HIDDEN_SOURCE_CACHE[cache_key] = result
         return result
@@ -554,9 +667,13 @@ def solve_slot_assignment(archive_targets, source_keys, destination_slot_targets
     # Work with semantic target keys first. A fallback is assigned once per
     # missing key, so every selected archive receives the same safe mapping.
     target_keys = set()
+    target_key_archive_counts = {}
     for destination, target_ids in archive_targets:
         slot_targets = destination_slot_targets[str(destination.archive_id).lower()]
-        target_keys.update(slot_targets[int(target_id)] for target_id in target_ids)
+        archive_keys = {slot_targets[int(target_id)] for target_id in target_ids}
+        target_keys.update(archive_keys)
+        for key in archive_keys:
+            target_key_archive_counts[key] = target_key_archive_counts.get(key, 0) + 1
 
     action_by_key = {}
     used_source_indices = set()
@@ -576,10 +693,27 @@ def solve_slot_assignment(archive_targets, source_keys, destination_slot_targets
     spare_source_indices = [
         index for index in range(len(source_keys)) if index not in used_source_indices
     ]
-    for key, source_index in zip(unmatched_keys, spare_source_indices):
+    # Pair spare sources with the closest body/slot target.  The previous
+    # positional zip could put a torso mesh into Any/cape while leaving the
+    # available Slim/Stocky torso IDs as dummy.
+    remaining_keys = set(unmatched_keys)
+    remaining_sources = set(spare_source_indices)
+    while remaining_keys and remaining_sources:
+        _, _, source_index, key = min(
+            (
+                coverage_fallback_score(source_keys[source_index], key),
+                -target_key_archive_counts.get(key, 0),
+                source_index,
+                key,
+            )
+            for source_index in remaining_sources
+            for key in remaining_keys
+        )
         action_by_key[key] = ("spare_source", source_index)
         used_source_indices.add(source_index)
-    for key in unmatched_keys[len(spare_source_indices):]:
+        remaining_sources.remove(source_index)
+        remaining_keys.remove(key)
+    for key in sorted(remaining_keys):
         # A valid one-vertex, zero-index mesh hides destination parts for
         # which there are no source Units left to assign.
         action_by_key[key] = ("dummy", None)
@@ -620,6 +754,148 @@ def solve_slot_assignment(archive_targets, source_keys, destination_slot_targets
         ),
         "dummy_target_count": sum(action[0] == "dummy" for action in assignment.values()),
     }
+
+
+def coverage_fallback_score(source_key, target_key):
+    """Rank a spare target while preserving BodyType/slot whenever possible."""
+    source_body, source_slot, source_layer = source_key
+    target_body, target_slot, target_layer = target_key
+    if source_key == target_key:
+        return 0
+    if source_body == target_body and source_slot == target_slot:
+        return 1  # Same body part, different layer: ideal ID-swap fallback.
+    if source_body == "Any" and target_body == "Any" and source_slot == target_slot:
+        return 1
+    if source_body == target_body:
+        return 2
+    if target_body == "Any" and source_slot == target_slot and source_layer == target_layer:
+        return 3
+    if target_body == "Any" and source_slot == target_slot:
+        return 4
+    if target_body == "Any":
+        return 5
+    if source_slot == target_slot:
+        return 6
+    return 7
+
+
+def ensure_per_archive_source_coverage(plan, archive_targets, source_keys, destination_slot_targets):
+    """Ensure every destination receives every real source payload exactly once.
+
+    Some armors use one ``Any`` Unit ID for both body types, while a source has
+    separate Slim and Stocky Units.  A single target ID cannot hold both.  In
+    that case route each source to an unused body-specific target (a different
+    layer is valid for an ID swap) and leave the shared Any target as dummy.
+    """
+    assignment = plan["assignment"]
+    source_count = len(source_keys)
+    memberships = {}
+    slot_keys_by_archive = []
+    coverage = [[0] * source_count for _ in archive_targets]
+
+    for archive_index, (destination, target_ids) in enumerate(archive_targets):
+        slot_targets = destination_slot_targets[str(destination.archive_id).lower()]
+        slot_keys_by_archive.append(slot_targets)
+        for target_id in target_ids:
+            target_id = int(target_id)
+            memberships.setdefault(target_id, set()).add(archive_index)
+            action = assignment[target_id]
+            if action[0] != "dummy" and action[0] != "preserve":
+                coverage[archive_index][int(action[1])] += 1
+
+    duplicates = []
+    for archive_index, counts in enumerate(coverage):
+        for source_index, count in enumerate(counts):
+            if count > 1:
+                duplicates.append((archive_index, source_index, count))
+    if duplicates:
+        archive_index, source_index, count = duplicates[0]
+        destination = archive_targets[archive_index][0]
+        raise MappingError(
+            f"{destination.name} would receive source slot "
+            f"{'/'.join(source_keys[source_index])} {count} times."
+        )
+
+    fallback_target_count = 0
+    # Fill the most constrained sources first.  A target may be shared by
+    # several destinations only when all of them are missing this source.
+    missing_by_source = {
+        source_index: {
+            archive_index
+            for archive_index, counts in enumerate(coverage)
+            if counts[source_index] == 0
+        }
+        for source_index in range(source_count)
+    }
+    source_order = sorted(
+        range(source_count),
+        key=lambda source_index: (-len(missing_by_source[source_index]), source_index),
+    )
+    for source_index in source_order:
+        missing_archives = missing_by_source[source_index]
+        while missing_archives:
+            candidates = []
+            for target_id, action in assignment.items():
+                if action[0] != "dummy":
+                    continue
+                target_memberships = memberships.get(int(target_id), set())
+                if not target_memberships or not target_memberships.issubset(missing_archives):
+                    continue
+                scores = [
+                    coverage_fallback_score(
+                        source_keys[source_index],
+                        slot_keys_by_archive[archive_index][int(target_id)],
+                    )
+                    for archive_index in target_memberships
+                ]
+                candidates.append(
+                    (
+                        max(scores),
+                        -len(target_memberships),
+                        sum(scores),
+                        int(target_id),
+                        target_memberships,
+                    )
+                )
+            if not candidates:
+                sample_index = min(missing_archives)
+                destination = archive_targets[sample_index][0]
+                raise MappingError(
+                    f"Could not place source slot {'/'.join(source_keys[source_index])} "
+                    f"exactly once in {destination.name}."
+                )
+            _, _, _, target_id, covered_archives = min(candidates)
+            assignment[target_id] = ("coverage_source", source_index)
+            fallback_target_count += 1
+            for archive_index in covered_archives:
+                coverage[archive_index][source_index] += 1
+            missing_archives.difference_update(covered_archives)
+
+    for archive_index, counts in enumerate(coverage):
+        if counts != [1] * source_count:
+            destination = archive_targets[archive_index][0]
+            raise MappingError(
+                f"Internal source coverage validation failed for {destination.name}: {counts}."
+            )
+
+    plan["coverage_fallback_target_count"] = fallback_target_count
+    plan["dummy_target_count"] = sum(
+        action[0] == "dummy" for action in assignment.values()
+    )
+    plan["override_target_ids"] = {
+        target_id for target_id, action in assignment.items() if action[0] != "preserve"
+    }
+    used_sources = {
+        int(action[1])
+        for action in assignment.values()
+        if action[0] not in {"dummy", "preserve"}
+    }
+    plan["skipped_source_keys"] = [
+        source_keys[index]
+        for index in range(source_count)
+        if index not in used_sources
+    ]
+    return plan
 
 
 def format_slot_keys(slot_keys, limit=8):
@@ -830,10 +1106,12 @@ def collect_source_entries_and_body_types(sdk, scene):
         entry = manager.GetEntry(int(source.entry_id), unit_id, SearchAll=False, IgnorePatch=False)
         if entry is None:
             raise MappingError(f"Could not find source Unit {source.entry_id}")
-        if is_hidden_dummy_unit(entry):
+        if is_hidden_dummy_unit(entry, sdk):
             ignored_dummy_ids.append(int(source.entry_id))
             continue
-        source_entries.append(copy.deepcopy(entry))
+        # Keep a stable TocEntry snapshot while sharing its immutable payload
+        # and parsed mesh graph.  Per-target aliases strip LoadedData later.
+        source_entries.append(copy.copy(entry))
         source_body_types.append(optional_entry_body_type(entry))
     return source_entries, source_body_types, ignored_dummy_ids
 
@@ -875,7 +1153,7 @@ def collect_source_archive_entries(sdk, scene, details):
                     f"{slot_key[0]}/{slot_key[1]}/{slot_key[2]}. Select one source archive."
                 )
             seen_keys[slot_key] = source_archive.name
-            source_entries.append(copy.deepcopy(entry))
+            source_entries.append(copy.copy(entry))
             source_keys.append(slot_key)
     return source_entries, source_keys
 
@@ -1051,12 +1329,14 @@ def build_invisible_dummy_template(source_entries, scene):
     settings = getattr(scene, "Hd2ToolPanelSettings", None)
     blender_options = settings.get_settings_dict() if settings is not None else {}
     for source_entry in source_entries:
-        template = copy.deepcopy(source_entry)
-        if not template.IsLoaded:
-            template.Load(True, False)
-        if getattr(template.LoadedData, "CompositeRef", 0):
+        # This source entry is already a shallow private snapshot.  Load it in
+        # place, then let make_dummy_unit_entry perform the one required deep
+        # copy before editing geometry.  The old flow deep-copied it twice.
+        if not source_entry.IsLoaded:
+            source_entry.Load(True, False)
+        if getattr(source_entry.LoadedData, "CompositeRef", 0):
             continue
-        return make_dummy_unit_entry(template, blender_options)
+        return make_dummy_unit_entry(source_entry, blender_options)
     raise MappingError(
         "Could not build an invisible fallback Unit: every selected source uses CompositeRef."
     )
@@ -1101,13 +1381,18 @@ def write_deduplicated_patch(patch, sdk):
     patch.Serialize(SerializeData=False)
 
     canonical_entries = {}
+    digest_cache = {}
     unique_payloads = 0
     for entries in patch.TocDict.values():
         for entry in entries.values():
-            digest, payload = payload_digest(entry)
+            digest, payload = payload_digest(entry, digest_cache)
             bucket = canonical_entries.setdefault(digest, [])
             canonical = next(
-                (candidate for candidate, candidate_payload in bucket if candidate_payload == payload),
+                (
+                    candidate
+                    for candidate, candidate_payload in bucket
+                    if payloads_equal(candidate_payload, payload)
+                ),
                 None,
             )
             if canonical is None:
@@ -1134,9 +1419,11 @@ def write_deduplicated_patch(patch, sdk):
     if len(patch.TocFile.Data) < minimum_toc_size:
         patch.TocFile.Data.extend(bytearray(minimum_toc_size - len(patch.TocFile.Data)))
     validate_patch_offsets(patch)
-    atomic_write(patch.Path, bytes(patch.TocFile.Data))
-    atomic_write(patch.Path + ".gpu_resources", bytes(patch.GpuFile.Data))
-    atomic_write(patch.Path + ".stream", bytes(patch.StreamFile.Data))
+    # Buffered file writes accept bytearray directly; bytes(...) created one
+    # more full-size copy of every completed patch file.
+    atomic_write(patch.Path, patch.TocFile.Data)
+    atomic_write(patch.Path + ".gpu_resources", patch.GpuFile.Data)
+    atomic_write(patch.Path + ".stream", patch.StreamFile.Data)
     return unique_payloads
 
 
@@ -1151,6 +1438,50 @@ def ensure_active_patch(sdk):
     return manager.ActivePatch
 
 
+def coalesce_loaded_patch_payloads(patch):
+    """Release duplicate buffers created when HD2SDK reopens a deduplicated patch.
+
+    HD2SDK allocates a new bytearray per TocEntry even when many records point
+    at the same offset.  For an existing patch loaded from disk, equal offset
+    ranges are the same immutable payload by definition and can safely share
+    their buffers again.  Never apply this provenance shortcut to a newly
+    assembled in-memory patch, where offsets may still belong to other TOCs.
+    """
+    toc_file = getattr(patch, "TocFile", None)
+    if toc_file is None or not toc_file.IsReading():
+        return 0
+
+    # TocEntries contains the records actually deserialized from this patch.
+    # Entries added later through the SDK live only in TocDict and may still
+    # carry offsets from a different source archive, so never coalesce those.
+    loaded_entry_objects = {id(entry) for entry in getattr(patch, "TocEntries", ())}
+    canonical = {}
+    merged = 0
+    for entries in patch.TocDict.values():
+        for entry in entries.values():
+            if id(entry) not in loaded_entry_objects or getattr(entry, "IsModified", False):
+                continue
+            key = (
+                int(entry.TocDataOffset), len(entry.TocData),
+                int(entry.GpuResourceOffset), len(entry.GpuData),
+                int(entry.StreamOffset), len(entry.StreamData),
+            )
+            original = canonical.get(key)
+            if original is None:
+                canonical[key] = entry
+                continue
+            entry.TocData = original.TocData
+            entry.GpuData = original.GpuData
+            entry.StreamData = original.StreamData
+            entry.TocData_OLD = original.TocData_OLD
+            entry.GpuData_OLD = original.GpuData_OLD
+            entry.StreamData_OLD = original.StreamData_OLD
+            merged += 1
+    if merged:
+        gc.collect()
+    return merged
+
+
 def managed_patch_properties(scene):
     if scene.hd2_ms_mode == "HELMET":
         return "hd2_ms_helmet_generated_patch_path", "hd2_ms_helmet_generated_ids"
@@ -1162,9 +1493,13 @@ def remove_previous_managed_entries(patch, scene, unit_id):
     path_prop, ids_prop = managed_patch_properties(scene)
     if getattr(scene, path_prop) != patch.Path:
         return
+    unit_entries = patch.TocDict.get(int(unit_id), {})
+    removed_any = False
     for value in getattr(scene, ids_prop).split(","):
         if value.isdigit():
-            patch.RemoveEntry(int(value), unit_id, ReloadUI=False)
+            removed_any = unit_entries.pop(int(value), None) is not None or removed_any
+    if removed_any:
+        patch.UpdateTypes()
 
 
 def remember_managed_entries(scene, patch, target_ids):
@@ -1458,6 +1793,12 @@ def analyze_mapping(sdk, scene):
             # slot/layer from the other body type before using spare/dummy data.
             allow_cross_body_fallback=True,
         )
+        plan = ensure_per_archive_source_coverage(
+            plan,
+            archive_targets,
+            source_keys,
+            destination_slot_targets,
+        )
         plan["ignored_dummy_source_ids"] = ignored_dummy_ids
         external_uses = find_external_uses(
             sdk,
@@ -1485,13 +1826,18 @@ def format_analysis(plan, source_count, archive_count, external_uses):
         spare_summary = (
             f" {plan['spare_source_target_key_count']} missing slot(s) use otherwise-unused source Units."
         )
+    coverage_summary = ""
+    if plan.get("coverage_fallback_target_count"):
+        coverage_summary = (
+            f" {plan['coverage_fallback_target_count']} target ID(s) use per-archive coverage fallback."
+        )
     dummy_summary = ""
     if plan.get("dummy_target_count"):
         dummy_summary = f" {plan['dummy_target_count']} target ID(s) use the hidden dummy fallback."
     ignored_source_summary = ""
     if plan.get("ignored_dummy_source_ids"):
         ignored_source_summary = (
-            f" Ignored {len(plan['ignored_dummy_source_ids'])} pre-hidden source Unit(s)."
+            f" Ignored {len(plan['ignored_dummy_source_ids'])} hidden/sparse non-render source Unit(s)."
         )
     rig_summary = ""
     if plan.get("incompatible_rig_target_ids"):
@@ -1502,7 +1848,8 @@ def format_analysis(plan, source_count, archive_count, external_uses):
         f"{archive_count} destination archive(s); "
         f"{override_count} override ID(s), {plan['target_count'] - override_count} preserved target ID(s), "
         f"{len(external_uses)} external archive package(s) share patched IDs."
-        f"{cross_body_summary}{spare_summary}{dummy_summary}{rig_summary}{skipped_summary}{ignored_source_summary}"
+        f"{cross_body_summary}{spare_summary}{coverage_summary}{dummy_summary}{rig_summary}"
+        f"{skipped_summary}{ignored_source_summary}"
     )
 
 
@@ -1539,52 +1886,74 @@ class HD2MS_OT_GenerateIdSwapPatch(Operator):
     bl_description = "Replace matching BodyType/slot/layer targets and hide unmatched slots"
 
     def execute(self, context):
+        total_started = time.perf_counter()
         sdk = get_sdk()
         scene = context.scene
         if sdk is None:
             self.report({'ERROR'}, "HD2SDK is not enabled or could not be imported")
             return {'CANCELLED'}
 
+        # Reopened deduplicated patches otherwise retain separate copies of
+        # the same payload for every target before analysis even begins.
+        active_patch = getattr(sdk.Global_TocManager, "ActivePatch", None)
+        coalesced_entries = (
+            coalesce_loaded_patch_payloads(active_patch)
+            if active_patch is not None
+            else 0
+        )
         try:
             archive_targets, plan, external_uses, source_entries = analyze_mapping(sdk, scene)
         except MappingError as error:
             scene.hd2_ms_analysis = f"BLOCKED — {error}"
             self.report({'ERROR'}, str(error))
             return {'CANCELLED'}
+        analysis_seconds = time.perf_counter() - total_started
 
         unit_id = int(sdk.UnitID)
         try:
+            preparation_started = time.perf_counter()
             patch = ensure_active_patch(sdk)
             remove_previous_managed_entries(patch, scene, unit_id)
             dummy_template = None
             if any(action[0] == "dummy" for action in plan["assignment"].values()):
                 dummy_template = build_invisible_dummy_template(source_entries, scene)
 
+            unit_entries = patch.TocDict.setdefault(unit_id, {})
             for target_id, action in plan["assignment"].items():
                 action_type, value = action
                 if action_type == "preserve":
                     continue
-                replacement = (
-                    copy.deepcopy(dummy_template)
+                template = (
+                    dummy_template
                     if action_type == "dummy"
-                    else copy.deepcopy(source_entries[value])
+                    else source_entries[value]
                 )
-                replacement.FileID = int(target_id)
-                replacement.TypeID = unit_id
-                patch.AddEntry(replacement, override=True, ReloadUI=False)
+                unit_entries[int(target_id)] = make_payload_alias(
+                    template,
+                    target_id,
+                    unit_id,
+                )
+            # StreamToc.AddEntry only updates this type table and optionally
+            # rebuilds the UI.  Do it once after the complete bulk insertion.
+            patch.UpdateTypes()
+            preparation_seconds = time.perf_counter() - preparation_started
 
+            write_started = time.perf_counter()
             unique_payloads = write_deduplicated_patch(patch, sdk)
+            write_seconds = time.perf_counter() - write_started
             remember_managed_entries(scene, patch, plan["override_target_ids"])
-            sdk.LoadEntryLists()
         except (MappingError, OSError, RuntimeError, ValueError) as error:
             self.report({'ERROR'}, f"Patch was not written: {error}")
             return {'CANCELLED'}
 
+        total_seconds = time.perf_counter() - total_started
         summary = format_analysis(plan, len(source_entries), len(archive_targets), external_uses)
         scene.hd2_ms_analysis = summary
         self.report(
             {'INFO'},
-            f"Wrote {len(plan['override_target_ids'])} Unit overrides with {unique_payloads} stored payloads."
+            f"Wrote {len(plan['override_target_ids'])} Unit overrides with {unique_payloads} stored payloads "
+            f"in {total_seconds:.1f}s (analyze {analysis_seconds:.1f}s, prepare {preparation_seconds:.1f}s, "
+            f"write {write_seconds:.1f}s, coalesced {coalesced_entries})."
         )
         return {'FINISHED'}
 
