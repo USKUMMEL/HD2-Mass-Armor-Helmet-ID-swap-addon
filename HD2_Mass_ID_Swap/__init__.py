@@ -301,6 +301,24 @@ def optional_entry_body_type(entry):
         return None
 
 
+def is_hidden_dummy_unit(entry):
+    """Recognize the valid one-vertex/zero-index Units commonly used to hide geometry."""
+    try:
+        if not entry.IsLoaded:
+            entry.Load(True, False)
+        meshes = entry.LoadedData.RawMeshes
+        return bool(meshes) and all(
+            len(mesh.VertexPositions) == 1
+            and not mesh.Indices
+            and all(material.NumIndices == 0 for material in mesh.Materials)
+            for mesh in meshes
+        )
+    except Exception:
+        # A source that cannot be inspected must remain available rather than
+        # being incorrectly discarded.
+        return False
+
+
 JSON_BODY_TYPES = {
     "lean": "Slim",
     "brawny": "Stocky",
@@ -749,6 +767,7 @@ def collect_source_entries_and_body_types(sdk, scene):
     unit_id = int(sdk.UnitID)
     source_entries = []
     source_body_types = []
+    ignored_dummy_ids = []
     for source in active_sources(scene):
         # Source is intentionally resolved through the active patch first, so
         # a source Unit edited by the user is copied byte-for-byte.
@@ -757,9 +776,12 @@ def collect_source_entries_and_body_types(sdk, scene):
         entry = manager.GetEntry(int(source.entry_id), unit_id, SearchAll=False, IgnorePatch=False)
         if entry is None:
             raise MappingError(f"Could not find source Unit {source.entry_id}")
+        if is_hidden_dummy_unit(entry):
+            ignored_dummy_ids.append(int(source.entry_id))
+            continue
         source_entries.append(copy.deepcopy(entry))
         source_body_types.append(optional_entry_body_type(entry))
-    return source_entries, source_body_types
+    return source_entries, source_body_types, ignored_dummy_ids
 
 
 def collect_source_archive_entries(sdk, scene, details):
@@ -1364,7 +1386,11 @@ def analyze_mapping(sdk, scene):
     try:
         details, _ = load_armor_list(active_dataset_mode(scene))
         archive_targets = collect_archive_targets(sdk, scene)
-        source_entries, source_body_types = collect_source_entries_and_body_types(sdk, scene)
+        source_entries, source_body_types, ignored_dummy_ids = collect_source_entries_and_body_types(sdk, scene)
+        if not source_entries:
+            raise MappingError(
+                "Every selected source Unit is an invisible dummy. Add at least one source Unit with real geometry."
+            )
         source_keys = source_slot_keys(details, source_entries, source_body_types)
         destination_slot_targets = {
             str(destination.archive_id).lower(): archive_slot_targets(details, destination.archive_id, target_ids)
@@ -1392,6 +1418,7 @@ def analyze_mapping(sdk, scene):
             # slot/layer from the other body type before using spare/dummy data.
             allow_cross_body_fallback=True,
         )
+        plan["ignored_dummy_source_ids"] = ignored_dummy_ids
         external_uses = find_external_uses(
             sdk,
             plan["override_target_ids"],
@@ -1421,6 +1448,11 @@ def format_analysis(plan, source_count, archive_count, external_uses):
     dummy_summary = ""
     if plan.get("dummy_target_count"):
         dummy_summary = f" {plan['dummy_target_count']} target ID(s) use the hidden dummy fallback."
+    ignored_source_summary = ""
+    if plan.get("ignored_dummy_source_ids"):
+        ignored_source_summary = (
+            f" Ignored {len(plan['ignored_dummy_source_ids'])} pre-hidden source Unit(s)."
+        )
     rig_summary = ""
     if plan.get("incompatible_rig_target_ids"):
         rig_summary = f" {len(plan['incompatible_rig_target_ids'])} target ID(s) have differing rig refs."
@@ -1430,7 +1462,7 @@ def format_analysis(plan, source_count, archive_count, external_uses):
         f"{archive_count} destination archive(s); "
         f"{override_count} override ID(s), {plan['target_count'] - override_count} preserved target ID(s), "
         f"{len(external_uses)} external archive package(s) share patched IDs."
-        f"{cross_body_summary}{spare_summary}{dummy_summary}{rig_summary}{skipped_summary}"
+        f"{cross_body_summary}{spare_summary}{dummy_summary}{rig_summary}{skipped_summary}{ignored_source_summary}"
     )
 
 
