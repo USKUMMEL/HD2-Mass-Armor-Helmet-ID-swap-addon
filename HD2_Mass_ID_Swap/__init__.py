@@ -33,6 +33,7 @@ ARMOR_LIST_CACHE = {}
 # UI, which is undesirable for a read-only destination lookup.
 TRANSIENT_ARCHIVES = {}
 TRANSIENT_UNIT_ENTRIES = {}
+HIDDEN_SOURCE_CACHE = {}
 EMBEDDED_SUPPORT_ICONS = {
     "paypal": "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAACcElEQVR42m2SS0jUURSHv3Pvf2Z0NB8VihGaKWGWRe0iclYVQpsC3RREFLqLFpGbYJhFgUgLd0W0iSCaoo1B0UZdVUQUkUKGCkH2GBojbcYZ597TYpx85G91uXC+e853rrA68bghkfDsHYhhoqdxWQcYMIuoe8lE/31QAdFSSbAGMIoBPF7OECq/AB7EgiqY0EU6Blt4zzV6kpaHPY4ifVXG8ACI7sBlHPn5PIvfHYupPPm0spQ9gYjycPxfB6sBAglPLB4AO0Et+XRA9oel8DNE6qPStq2Dp0vHIeFJql0HiAsAs6F6kAb8EhTyggcyOcEGjs7OKKl0FwDjyDoHE0VAOGjChMpxOU9l1CCqVG5yxA47mhpDfP/yoSRsLSDWLowB1rRSEKir9XSfEkwg1G4NiEQDUl8mKDePUBXAkVgvEQC7C6eezdWemhowJs3879v8/HYFzcY41/yraKy4ypUO6vYsm/UHkLChqkIJlzv8wgh923tXHlApFZckCrF4wPRc8WxtnMKfY7Q3v6OqMsDaKYYmIyS1smh+uVhViOsGE5RyZzbGg9xZhiZb1twn1RIfCVZ233Z9C8ZcwtgMkYUh3iQy/8FuTZ+ltqGFudlh+lpeA3D7cyvqOgICewSVTpQaFqPCnhsZKHwlsDmqNr1iYSGGCc6QmS8gwUFuzTxGxOJdIyJiwOzGloXB3wO6QOpQOYdzh0iln1FT3UrY1pPLjKNaQMx+kJOIHMXwwuC9Zyl7lfH+QVRGseFq8HcxZoaCn2L4/B2yuSf07biM6k0iFWWovkX1Od59WpmzO2mXv3TRbPtAL/sG69bI2yB/AR6y8SXyg7NRAAAAAElFTkSuQmCC",
     "kofi": "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAACSElEQVR42qWTT0tUcRSGn/O7d+6d8Ro6Uu3cZYlUqCAmQYkbK3KpVvYBWvQBohZJi7YFRos+gP9aCCVYG4M2LYxSMxEtCApaVOrkaHPv3Ps7LUZzdGrVWR7OX97nhfJQFVQN/wpVg6qUp9w9zSIKaONU2CqOnMPao6Uqs6xFfbYk8mZfLVKeaBpfr5Oa9AMc97JJO6DbwwVsIYEkHtFc4fpiX+3qTo9w+7aBQU60URO74TTVfnO8vmUBu+8B42erDJvhrER+17sZcjCI9I6r87hPksbJ/KiTDfqr8luRg3r6Z7uAMYCyFtrI1gSet7E5tnih+lLvuDoC0PY83/xN02/PZpPkXnPKEU8w2/8poEVFEHJF5cZ8lLz66ToHKbTMdFfPugChNT027eihVKRZz6P4Yhq+fC5dUF9PqrOLu+8j6nzDUEtKz7w2msvRA5QGqGgDisQqKJCfmMAuzJceP36S2s4uFnKWBOXaEZeMICHSAPBXzdMDA0gQIEFAMHAVVbjfkmK4w+fhhyLfI0hLGQeiuoKgKUcQlEz7Kfybt0oXtLcDyssfMPypwNx6QnU2pfGWruwOMDx1o+TOch75WoCMWEzHaQBsaPmlwqOPRebWLIczRmwhEcdJPQF2ZWyazI/a2qA/s7EV+a54aks6ijGEVtmMwRMbSW3gFVc3x5Yu7shYBpJ1w2k94DcX1/aCJIBrMKamyiQb4awbl4FUgXK2aggxV/ajnBQSNIlHpALlSjPROBW2Gtfp1iQ+tsdM5/0KM/G/dv4N4zQouRknkjEAAAAASUVORK5CYII=",
@@ -314,21 +315,39 @@ def optional_entry_body_type(entry):
 
 def is_hidden_dummy_unit(entry):
     """Recognize the valid one-vertex/zero-index Units commonly used to hide geometry."""
-    # Real armor meshes are normally far larger than a one-vertex fallback.
-    # Avoid ``Unit.Load`` (which parses geometry/materials) for them; this is
-    # critical when the source list contains hundreds of patched Units.
-    if len(getattr(entry, "GpuData", b"")) > 4096:
+    cache_key = (
+        int(getattr(entry, "TocDataOffset", 0)),
+        int(getattr(entry, "GpuResourceOffset", 0)),
+        int(getattr(entry, "StreamOffset", 0)),
+        len(getattr(entry, "TocData", b"")),
+        len(getattr(entry, "GpuData", b"")),
+        len(getattr(entry, "StreamData", b"")),
+    )
+    # Fresh in-memory SDK entries can all have zero offsets; do not cache them
+    # together because they may contain different data.
+    can_cache = any(cache_key[:3])
+    if can_cache and cache_key in HIDDEN_SOURCE_CACHE:
+        return HIDDEN_SOURCE_CACHE[cache_key]
+
+    # A hidden Unit may retain several mesh/LOD records, making it larger than
+    # the old 4 KB shortcut.  64 KB still avoids parsing normal armor meshes.
+    if len(getattr(entry, "GpuData", b"")) > 65536:
+        if can_cache:
+            HIDDEN_SOURCE_CACHE[cache_key] = False
         return False
     try:
         if not entry.IsLoaded:
             entry.Load(True, False)
         meshes = entry.LoadedData.RawMeshes
-        return bool(meshes) and all(
+        result = bool(meshes) and all(
             len(mesh.VertexPositions) == 1
             and not mesh.Indices
             and all(material.NumIndices == 0 for material in mesh.Materials)
             for mesh in meshes
         )
+        if can_cache:
+            HIDDEN_SOURCE_CACHE[cache_key] = result
+        return result
     except Exception:
         # A source that cannot be inspected must remain available rather than
         # being incorrectly discarded.
@@ -784,6 +803,7 @@ def collect_source_entries_and_body_types(sdk, scene):
     source_entries = []
     source_body_types = []
     ignored_dummy_ids = []
+    HIDDEN_SOURCE_CACHE.clear()
     for source in active_sources(scene):
         # Source is intentionally resolved through the active patch first, so
         # a source Unit edited by the user is copied byte-for-byte.
