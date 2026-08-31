@@ -339,12 +339,30 @@ def is_hidden_dummy_unit(entry):
         if not entry.IsLoaded:
             entry.Load(True, False)
         meshes = entry.LoadedData.RawMeshes
-        result = bool(meshes) and all(
+        fully_hidden = bool(meshes) and all(
             len(mesh.VertexPositions) == 1
             and not mesh.Indices
             and all(material.NumIndices == 0 for material in mesh.Materials)
             for mesh in meshes
         )
+        visible_meshes = [
+            mesh for mesh in meshes
+            if mesh.Indices or any(material.NumIndices for material in mesh.Materials)
+        ]
+        visible_vertices = sum(len(mesh.VertexPositions) for mesh in visible_meshes)
+        visible_indices = sum(len(mesh.Indices) for mesh in visible_meshes)
+        hidden_meshes = len(meshes) - len(visible_meshes)
+        # Some existing hide Units keep one tiny sentinel triangle mesh while
+        # all LOD/body meshes are one-vertex shells.  Treat that pattern as
+        # hidden too; a real armor piece has substantially more geometry.
+        mostly_hidden = (
+            len(meshes) >= 3
+            and hidden_meshes >= len(meshes) - 1
+            and len(visible_meshes) <= 1
+            and visible_vertices <= 64
+            and visible_indices <= 96
+        )
+        result = fully_hidden or mostly_hidden
         if can_cache:
             HIDDEN_SOURCE_CACHE[cache_key] = result
         return result
