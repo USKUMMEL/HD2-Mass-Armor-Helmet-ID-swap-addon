@@ -314,6 +314,11 @@ def optional_entry_body_type(entry):
 
 def is_hidden_dummy_unit(entry):
     """Recognize the valid one-vertex/zero-index Units commonly used to hide geometry."""
+    # Real armor meshes are normally far larger than a one-vertex fallback.
+    # Avoid ``Unit.Load`` (which parses geometry/materials) for them; this is
+    # critical when the source list contains hundreds of patched Units.
+    if len(getattr(entry, "GpuData", b"")) > 4096:
+        return False
     try:
         if not entry.IsLoaded:
             entry.Load(True, False)
