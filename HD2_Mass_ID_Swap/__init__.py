@@ -1,7 +1,7 @@
 bl_info = {
     "name": "HD2_Mass_ID_Swap",
     "author": "HD2SDK Script Workspace",
-    "version": (1, 1, 0),
+    "version": (1, 2, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > HD2",
     "description": "Collect source armor Units and destination archives for multi-ID swaps",
@@ -17,6 +17,7 @@ import json
 import os
 import struct
 import sys
+import tempfile
 import time
 import zlib
 
@@ -36,6 +37,22 @@ ARMOR_LIST_CACHE = {}
 TRANSIENT_ARCHIVES = {}
 TRANSIENT_UNIT_ENTRIES = {}
 HIDDEN_SOURCE_CACHE = {}
+DESTINATION_CAPACITY_CACHE = {}
+ID_SWAP_MAPPING_FILENAME = "hd2_mass_id_swap_last_mapping.json"
+# Community archive sheet exclusions (Armor IDs tab): NPC packages are not
+# player destinations, and duplicate families keep the package explicitly
+# marked "Modify This One For Players".
+# https://docs.google.com/spreadsheets/d/1oQys_OI5DWou4GeRE3mW56j7BIi4M7KftBIPAl1ULFw/edit?gid=0
+EXCLUDED_ARMOR_ARCHIVE_IDS = {
+    "31d06451a09679f1",  # FS-05 Marksman - NPC
+    "ccac0a57aca3ae92",  # FS-05 Marksman - NPC
+    "5e0dba19a567fb99",  # DP-53 Savior of the Free - NPC
+    "d5f85cb5efb44cd2",  # SC-37 duplicate; keep dd3c12b413651958
+    "c72998936b1d88a2",  # SC-37 duplicate; keep dd3c12b413651958
+    "788df19150915809",  # B-24 duplicate; keep 33cecc4e485ea3c4
+    "1866f762c49358ea",  # B-24 duplicate; keep 33cecc4e485ea3c4
+    "0fecb336be1d287b",  # UF-84 duplicate; keep 91033cfaaad4ad18
+}
 EMBEDDED_SUPPORT_ICONS = {
     "paypal": "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAACcElEQVR42m2SS0jUURSHv3Pvf2Z0NB8VihGaKWGWRe0iclYVQpsC3RREFLqLFpGbYJhFgUgLd0W0iSCaoo1B0UZdVUQUkUKGCkH2GBojbcYZ597TYpx85G91uXC+e853rrA68bghkfDsHYhhoqdxWQcYMIuoe8lE/31QAdFSSbAGMIoBPF7OECq/AB7EgiqY0EU6Blt4zzV6kpaHPY4ifVXG8ACI7sBlHPn5PIvfHYupPPm0spQ9gYjycPxfB6sBAglPLB4AO0Et+XRA9oel8DNE6qPStq2Dp0vHIeFJql0HiAsAs6F6kAb8EhTyggcyOcEGjs7OKKl0FwDjyDoHE0VAOGjChMpxOU9l1CCqVG5yxA47mhpDfP/yoSRsLSDWLowB1rRSEKir9XSfEkwg1G4NiEQDUl8mKDePUBXAkVgvEQC7C6eezdWemhowJs3879v8/HYFzcY41/yraKy4ypUO6vYsm/UHkLChqkIJlzv8wgh923tXHlApFZckCrF4wPRc8WxtnMKfY7Q3v6OqMsDaKYYmIyS1smh+uVhViOsGE5RyZzbGg9xZhiZb1twn1RIfCVZ233Z9C8ZcwtgMkYUh3iQy/8FuTZ+ltqGFudlh+lpeA3D7cyvqOgICewSVTpQaFqPCnhsZKHwlsDmqNr1iYSGGCc6QmS8gwUFuzTxGxOJdIyJiwOzGloXB3wO6QOpQOYdzh0iln1FT3UrY1pPLjKNaQMx+kJOIHMXwwuC9Zyl7lfH+QVRGseFq8HcxZoaCn2L4/B2yuSf07biM6k0iFWWovkX1Od59WpmzO2mXv3TRbPtAL/sG69bI2yB/AR6y8SXyg7NRAAAAAElFTkSuQmCC",
     "kofi": "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAACSElEQVR42qWTT0tUcRSGn/O7d+6d8Ro6Uu3cZYlUqCAmQYkbK3KpVvYBWvQBohZJi7YFRos+gP9aCCVYG4M2LYxSMxEtCApaVOrkaHPv3Ps7LUZzdGrVWR7OX97nhfJQFVQN/wpVg6qUp9w9zSIKaONU2CqOnMPao6Uqs6xFfbYk8mZfLVKeaBpfr5Oa9AMc97JJO6DbwwVsIYEkHtFc4fpiX+3qTo9w+7aBQU60URO74TTVfnO8vmUBu+8B42erDJvhrER+17sZcjCI9I6r87hPksbJ/KiTDfqr8luRg3r6Z7uAMYCyFtrI1gSet7E5tnih+lLvuDoC0PY83/xN02/PZpPkXnPKEU8w2/8poEVFEHJF5cZ8lLz66ToHKbTMdFfPugChNT027eihVKRZz6P4Yhq+fC5dUF9PqrOLu+8j6nzDUEtKz7w2msvRA5QGqGgDisQqKJCfmMAuzJceP36S2s4uFnKWBOXaEZeMICHSAPBXzdMDA0gQIEFAMHAVVbjfkmK4w+fhhyLfI0hLGQeiuoKgKUcQlEz7Kfybt0oXtLcDyssfMPypwNx6QnU2pfGWruwOMDx1o+TOch75WoCMWEzHaQBsaPmlwqOPRebWLIczRmwhEcdJPQF2ZWyazI/a2qA/s7EV+a54aks6ijGEVtmMwRMbSW3gFVc3x5Yu7shYBpJ1w2k94DcX1/aCJIBrMKamyiQb4awbl4FUgXK2aggxV/ajnBQSNIlHpALlSjPROBW2Gtfp1iQ+tsdM5/0KM/G/dv4N4zQouRknkjEAAAAASUVORK5CYII=",
@@ -243,12 +260,75 @@ def get_destination_unit_ids(sdk, archive_id):
             str(archive.Name).lower() == archive_id
             or os.path.basename(str(archive.Path)).lower() == archive_id
         ):
-            return list(dict.fromkeys(int(entry_id) for entry_id in archive.TocEntries.get(unit_id, [])))
+            target_ids = list(dict.fromkeys(int(entry_id) for entry_id in archive.TocEntries.get(unit_id, [])))
+            remember_destination_capacity(sdk, archive_id, len(target_ids))
+            return target_ids
 
     # This fallback is needed only when HD2SDK has not built SearchArchives
     # yet. It is deliberately private, so it does not add to Loaded Archives.
     archive = get_transient_archive(sdk, archive_id)
-    return list(archive.TocDict.get(unit_id, {}).keys())
+    target_ids = list(archive.TocDict.get(unit_id, {}).keys())
+    remember_destination_capacity(sdk, archive_id, len(target_ids))
+    return target_ids
+
+
+def destination_capacity_cache_key(sdk, archive_id):
+    return (
+        os.path.normcase(os.path.abspath(str(getattr(sdk, "Global_gamepath", "")))),
+        int(sdk.UnitID),
+        str(archive_id).lower(),
+    )
+
+
+def remember_destination_capacity(sdk, archive_id, capacity):
+    DESTINATION_CAPACITY_CACHE[destination_capacity_cache_key(sdk, archive_id)] = int(capacity)
+
+
+def cached_destination_capacity(sdk, archive_id):
+    """Read a destination's live Unit capacity without loading it into HD2SDK."""
+    cache_key = destination_capacity_cache_key(sdk, archive_id)
+    cached = DESTINATION_CAPACITY_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    archive_id = str(archive_id).lower()
+    unit_id = int(sdk.UnitID)
+    for archive in sdk.Global_TocManager.SearchArchives:
+        if (
+            str(archive.Name).lower() == archive_id
+            or os.path.basename(str(archive.Path)).lower() == archive_id
+        ):
+            capacity = len(dict.fromkeys(int(entry_id) for entry_id in archive.TocEntries.get(unit_id, [])))
+            DESTINATION_CAPACITY_CACHE[cache_key] = capacity
+            return capacity
+    return None
+
+
+def destination_capacity_issues(archive_targets, required_count):
+    issues = []
+    for destination, target_ids in archive_targets:
+        available_count = len(set(int(target_id) for target_id in target_ids))
+        missing_count = max(0, int(required_count) - available_count)
+        if missing_count:
+            issues.append((destination, available_count, missing_count))
+    return issues
+
+
+def validate_destination_capacities(archive_targets, required_count):
+    """Fail once with every undersized destination instead of a source-slot error."""
+    issues = destination_capacity_issues(archive_targets, required_count)
+    if not issues:
+        return
+
+    rendered = "; ".join(
+        f"{destination.name} ({destination.archive_id}): {available_count} available, "
+        f"{required_count} required, missing {missing_count}"
+        for destination, available_count, missing_count in issues
+    )
+    raise MappingError(
+        f"{len(issues)} destination armor(s) do not have enough Unit slots for "
+        f"{required_count} usable source Unit(s); {rendered}."
+    )
 
 
 def get_transient_unit_entry(target_id):
@@ -530,6 +610,8 @@ def load_armor_list(mode="ARMOR"):
         categories[category] = []
         for archive_id, archive_details in category_archives.items():
             archive_id = str(archive_id).lower()
+            if mode == "ARMOR" and archive_id in EXCLUDED_ARMOR_ARCHIVE_IDS:
+                continue
             if archive_id in archives:
                 raise MappingError(f"Armor_List.json repeats archive {archive_id}.")
             if not isinstance(archive_details, dict):
@@ -642,9 +724,14 @@ def source_slot_keys(details, source_entries, source_body_types):
         if len(candidates) != 1:
             rendered = ", ".join("/".join(key) for key in sorted(candidates)) or "none"
             body_label = body_type if body_type is not None else "unavailable"
+            if not candidates:
+                raise MappingError(
+                    f"Source Unit {entry_id} is not assigned to any {body_label} slot in the bundled "
+                    "armor database. Remove this Unit from the source list or update Armor_List.json."
+                )
             raise MappingError(
-                f"Source Unit {entry_id} cannot be resolved to one slot for BodyType {body_label} "
-                f"(JSON candidates: {rendered})."
+                f"Source Unit {entry_id} matches multiple {body_label} slots in the bundled armor "
+                f"database ({rendered}). Remove the duplicate slot assignment from Armor_List.json."
             )
         key = candidates.pop()
         if key in used_keys:
@@ -1349,11 +1436,15 @@ def validate_patch_offsets(patch):
     stream_size = len(patch.StreamFile.Data)
     for entries in patch.TocDict.values():
         for entry in entries.values():
-            if entry.TocDataOffset + len(entry.TocData) > toc_size:
+            # HD2SDK assigns the current/aligned cursor as the offset even for
+            # an empty payload.  That offset can legitimately be just beyond
+            # EOF because no bytes are stored there; only non-empty ranges
+            # need to be contained by their backing file.
+            if entry.TocData and entry.TocDataOffset + len(entry.TocData) > toc_size:
                 raise MappingError(f"TOC payload for Unit {entry.FileID} is out of bounds.")
-            if entry.GpuResourceOffset + len(entry.GpuData) > gpu_size:
+            if entry.GpuData and entry.GpuResourceOffset + len(entry.GpuData) > gpu_size:
                 raise MappingError(f"GPU payload for Unit {entry.FileID} is out of bounds.")
-            if entry.StreamOffset + len(entry.StreamData) > stream_size:
+            if entry.StreamData and entry.StreamOffset + len(entry.StreamData) > stream_size:
                 raise MappingError(f"Stream payload for Unit {entry.FileID} is out of bounds.")
             if entry.GpuResourceOffset % 64 != 0 and entry.GpuData:
                 raise MappingError(f"GPU payload for Unit {entry.FileID} is not 64-byte aligned.")
@@ -1371,6 +1462,68 @@ def atomic_write(path, data):
         if os.path.exists(temporary_path):
             os.remove(temporary_path)
         raise
+
+
+def lut_mapping_slot_key(slot_key):
+    """Convert Armor_List body names to the LUT add-on's semantic key."""
+    body, region, layer = slot_key
+    body_names = {"Stocky": "brawny", "Slim": "lean", "Any": "any_shared"}
+    return [body_names.get(str(body), str(body).lower()), str(region).lower(), str(layer).lower(), 0]
+
+
+def build_id_swap_mapping_sidecar(sdk, scene, patch, archive_targets, plan, source_entries):
+    """Describe the actual target Unit -> source semantic-slot routing for LUT Swap."""
+    mode = active_dataset_mode(scene)
+    details, _ = load_armor_list(mode)
+    target_slots = {}
+    destinations = []
+    for destination, target_ids in archive_targets:
+        archive_id = str(destination.archive_id).lower()
+        destinations.append({"archive_id": archive_id, "name": str(destination.name)})
+        slots = archive_slot_targets(details, archive_id, target_ids)
+        for target_id, slot_key in slots.items():
+            record = {
+                "archive_id": archive_id,
+                "slot": lut_mapping_slot_key(slot_key),
+            }
+            records = target_slots.setdefault(int(target_id), [])
+            if record not in records:
+                records.append(record)
+
+    assignments = {}
+    source_keys = plan["source_slot_keys"]
+    for target_id, action in plan["assignment"].items():
+        action_type, source_index = action
+        if action_type in {"dummy", "preserve"} or source_index is None:
+            continue
+        source_index = int(source_index)
+        assignments[str(int(target_id))] = {
+            "source_unit_id": str(int(source_entries[source_index].FileID)),
+            "source_slot": lut_mapping_slot_key(source_keys[source_index]),
+            "target_slots": target_slots.get(int(target_id), []),
+            "action": str(action_type),
+        }
+
+    return {
+        "schema_version": 1,
+        "producer": "HD2_Mass_ID_Swap",
+        "mode": mode,
+        "created_unix": time.time(),
+        "game_data_path": os.path.normcase(os.path.abspath(str(sdk.Global_gamepath))),
+        "armor_patch_path": os.path.normcase(os.path.abspath(str(patch.Path))),
+        "destinations": destinations,
+        "assignments": assignments,
+    }
+
+
+def write_id_swap_mapping_sidecar(sdk, scene, patch, archive_targets, plan, source_entries):
+    payload = build_id_swap_mapping_sidecar(
+        sdk, scene, patch, archive_targets, plan, source_entries
+    )
+    path = os.path.join(tempfile.gettempdir(), ID_SWAP_MAPPING_FILENAME)
+    data = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+    atomic_write(path, data)
+    return path, len(payload["assignments"])
 
 
 def write_deduplicated_patch(patch, sdk):
@@ -1529,8 +1682,27 @@ class HD2MS_UL_Sources(UIList):
 
 class HD2MS_UL_Destinations(UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        required_count = len(active_sources(context.scene))
+        sdk = get_sdk()
+        available_count = cached_destination_capacity(sdk, item.archive_id) if sdk is not None else None
+        insufficient = (
+            required_count > 0
+            and available_count is not None
+            and available_count < required_count
+        )
         row = layout.row(align=True)
-        row.label(text=item.name, icon='FILE_FOLDER')
+        row.alert = insufficient
+        capacity_text = (
+            f" — {available_count}/{required_count} Unit slots"
+            if available_count is not None and required_count
+            else f" — {available_count} Unit slots"
+            if available_count is not None
+            else ""
+        )
+        row.label(
+            text=f"{item.name}{capacity_text}",
+            icon='ERROR' if insufficient else 'FILE_FOLDER',
+        )
         remove = row.operator("hd2_multi_swap.remove_destination", text="", icon='X')
         remove.index = index
 
@@ -1616,7 +1788,11 @@ class HD2MS_OT_AddDestinationArchive(Operator):
     def execute(self, context):
         try:
             details, _ = load_armor_list(active_dataset_mode(context.scene))
-            selected = details.get(str(self.archive_id).lower(), {})
+            selected_archive_id = str(self.archive_id).lower()
+            selected = details.get(selected_archive_id)
+            if not isinstance(selected, dict):
+                self.report({'INFO'}, "This archive is not a supported player armor/helmet destination")
+                return {'CANCELLED'}
             family_name = str(selected.get("name") or self.archive_name)
             family_archives = [
                 (archive_id, str(data.get("name") or archive_id))
@@ -1730,9 +1906,18 @@ class HD2MS_OT_BrowseArchives(Operator):
             layout.label(text="Type an archive name or ID to search.", icon='INFO')
             return
 
+        try:
+            supported_archives, _ = load_armor_list(active_dataset_mode(context.scene))
+            supported_archive_ids = set(supported_archives)
+        except MappingError as error:
+            layout.label(text=str(error), icon='ERROR')
+            return
+
         matches = []
         for archive_id, archive_name in sdk.Global_ArchiveHashes:
-            archive_id = str(archive_id)
+            archive_id = str(archive_id).lower()
+            if archive_id not in supported_archive_ids:
+                continue
             archive_name = str(archive_name) if archive_name else archive_id
             if query in archive_name.lower() or query in archive_id.lower():
                 matches.append((archive_name, archive_id))
@@ -1780,6 +1965,10 @@ def analyze_mapping(sdk, scene):
             raise MappingError(
                 "Every selected source Unit is an invisible dummy. Add at least one source Unit with real geometry."
             )
+        # Capacity is independent of semantic slot labels. Check it first so
+        # an undersized destination produces one useful, aggregated error
+        # instead of failing on an arbitrary unresolved source slot.
+        validate_destination_capacities(archive_targets, len(source_entries))
         source_keys = source_slot_keys(details, source_entries, source_body_types)
         destination_slot_targets = {
             str(destination.archive_id).lower(): archive_slot_targets(details, destination.archive_id, target_ids)
@@ -1887,6 +2076,8 @@ class HD2MS_OT_GenerateIdSwapPatch(Operator):
 
     def execute(self, context):
         total_started = time.perf_counter()
+        mapping_count = 0
+        mapping_error = None
         sdk = get_sdk()
         scene = context.scene
         if sdk is None:
@@ -1946,15 +2137,29 @@ class HD2MS_OT_GenerateIdSwapPatch(Operator):
             self.report({'ERROR'}, f"Patch was not written: {error}")
             return {'CANCELLED'}
 
+        # The LUT add-on consumes this sidecar to follow spare/cross-body Unit
+        # routing instead of assuming the destination's original semantic slot.
+        try:
+            _, mapping_count = write_id_swap_mapping_sidecar(
+                sdk, scene, patch, archive_targets, plan, source_entries
+            )
+        except (MappingError, OSError, TypeError, ValueError) as error:
+            # The Unit patch is already safely on disk; report a mapping
+            # warning without falsely claiming that the patch write failed.
+            mapping_error = str(error)
+
         total_seconds = time.perf_counter() - total_started
         summary = format_analysis(plan, len(source_entries), len(archive_targets), external_uses)
         scene.hd2_ms_analysis = summary
-        self.report(
-            {'INFO'},
+        message = (
             f"Wrote {len(plan['override_target_ids'])} Unit overrides with {unique_payloads} stored payloads "
-            f"in {total_seconds:.1f}s (analyze {analysis_seconds:.1f}s, prepare {preparation_seconds:.1f}s, "
+            f"and {mapping_count} LUT mapping route(s) in {total_seconds:.1f}s "
+            f"(analyze {analysis_seconds:.1f}s, prepare {preparation_seconds:.1f}s, "
             f"write {write_seconds:.1f}s, coalesced {coalesced_entries})."
         )
+        if mapping_error:
+            message += f" LUT mapping sidecar was not updated: {mapping_error}"
+        self.report({'WARNING'} if mapping_error else {'INFO'}, message)
         return {'FINISHED'}
 
 
